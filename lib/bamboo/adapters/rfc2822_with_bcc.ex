@@ -18,6 +18,8 @@ defmodule Bamboo.SesAdapter.RFC2822WithBcc do
   # https://tools.ietf.org/html/rfc2822#section-3.4.1
   @email_validation_regex ~r/\w+@\w+\.\w+/
 
+  @text_parts_transfer_encoding "base64"
+
   @doc """
   Renders a message according to the RFC2882 spec
   """
@@ -172,33 +174,55 @@ defmodule Bamboo.SesAdapter.RFC2822WithBcc do
   defp reorganize(%Message{multipart: true} = message) do
     content_type = Message.get_content_type(message)
 
-    if Message.has_attachment?(message) do
-      text_parts =
-        message.parts
-        |> Enum.filter(&(match_content_type?(&1, ~r/text\/(plain|html)/)))
-        |> Enum.sort(&(&1 > &2))
+    text_parts =
+      message.parts
+      |> Enum.filter(&(match_content_type?(&1, ~r/text\/(plain|html)/)))
+      |> Enum.sort(&(&1 > &2))
 
-      content_type = List.replace_at(content_type, 0, "multipart/mixed")
-      message = Message.put_content_type(message, content_type)
+    if Enum.any?(text_parts) do
+      # Delete text parts
+      message =
+        text_parts
+        |> Enum.reduce(message, &(Message.delete_part(&2, &1)))
 
-      if Enum.any?(text_parts) do
-        message =
-          text_parts
-          |> Enum.reduce(message, &(Message.delete_part(&2, &1)))
-        mixed_part =
+      # Update text parts so that their transfer encoding is set to what we want
+      updated_text_parts =
+        text_parts
+        |> Enum.map(&(Message.put_header(&1, :content_transfer_encoding, @text_parts_transfer_encoding)))
+
+      if Message.has_attachment?(message) do
+        # Has attachments
+        # Mark the top-level part as mixed. It will contain the alternative part with text parts,
+        # and the attachments.
+        content_type = List.replace_at(content_type, 0, "multipart/mixed")
+        message = Message.put_content_type(message, content_type)
+
+        # Create the alternative part to contain the textual parts
+        alternative_part =
           Mail.build_multipart()
           |> Message.put_content_type("multipart/alternative")
 
-        mixed_part =
-          text_parts
-          |> Enum.reduce(mixed_part, &(Message.put_part(&2, &1)))
-        put_in(message.parts, List.insert_at(message.parts, 0, mixed_part))
+        # Put updated text parts into the alternative part
+        alternative_part =
+          updated_text_parts
+          |> Enum.reduce(alternative_part, &(Message.put_part(&2, &1)))
+
+        # Insert the alternative with text at the beginning
+        put_in(message.parts, List.insert_at(message.parts, 0, alternative_part))
+      else
+        # Only text parts, no attachments
+        content_type = List.replace_at(content_type, 0, "multipart/alternative")
+        message = Message.put_content_type(message, content_type)
+
+        # Replace parts with updated text
+        put_in(message.parts, updated_text_parts)
       end
     else
-      content_type = List.replace_at(content_type, 0, "multipart/alternative")
-      Message.put_content_type(message, content_type)
+      # No text parts, send as is
+      message
     end
   end
+
   defp reorganize(%Message{} = message), do: message
 
   defp encode(body, message) do
